@@ -15,10 +15,13 @@ with reduced mobility or sensation.
 tank above 60 °C, which is dangerous without thermostatic mixing valves
 (TMVs). Read the legionella section carefully before enabling.
 
-**Sensor failures are handled safely.** If your electricity rate sensor
-goes down, ThermoSync defaults to a high rate (999 p/kWh) rather than
-zero — preventing accidental heating at full grid price during API
-outages.
+**Tank sensor failures strictly stop heating, while rate sensor
+failures fall back to conservative planned-window heating.** If the
+tank sensor goes `unavailable` or `unknown`, ThermoSync refuses to
+heat — it will not operate blind. If the electricity rate sensor fails,
+the rate defaults to **999 p/kWh** (never 0), which prevents accidental
+negative-rate heating at full grid price and causes the system to fall
+back to planned TargetTimeframes windows at `base_temperature` only.
 
 ## Features
 
@@ -43,7 +46,7 @@ outages.
 
 ### Step 1 — Install the blueprint
 
-[![Open your Home Assistant instance and show the blueprint import dialog with a specific blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fdandancheeseandham%2Fthermosync-homeassistant%2Fblob%2Fmain%2Fblueprint%2Fautomation%2Fthermosync.yaml)
+[![Open your Home Assistant instance and import this blueprint.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https://github.com/ha-community/thermosync/blob/main/blueprints/automation/thermosync.yaml)
 
 Or manually: copy `thermosync.yaml` into
 `config/blueprints/automation/thermosync/`
@@ -120,7 +123,7 @@ Go to **Settings → Devices & Services → Target Timeframes** → Configure.
 |------------------|--------------------------------|
 | Name             | `ThermoSync Overnight`         |
 | Hours            | `2.0` (winter-sized)           |
-| Type             | `Intermittent`                 |
+| Type             | `Intermittent` (immersion) / `Continuous` (heat pump) |
 | Start time       | `22:00`                        |
 | End time         | `07:00`                        |
 | Offset           | `-00:00:30`                    |
@@ -134,7 +137,7 @@ Creates `binary_sensor.target_thermosync_overnight`.
 |------------------|--------------------------------|
 | Name             | `ThermoSync Midday`            |
 | Hours            | `1.5` (winter-sized)           |
-| Type             | `Intermittent`                 |
+| Type             | `Intermittent` (immersion) / `Continuous` (heat pump) |
 | Start time       | `09:00`                        |
 | End time         | `15:30`                        |
 | Offset           | `-00:00:30`                    |
@@ -148,13 +151,22 @@ Creates `binary_sensor.target_thermosync_midday`.
 |------------------|--------------------------------|
 | Name             | `ThermoSync Evening`           |
 | Hours            | `1.5` (winter-sized)           |
-| Type             | `Intermittent`                 |
+| Type             | `Intermittent` (immersion) / `Continuous` (heat pump) |
 | Start time       | `19:00`                        |
 | End time         | `22:00`                        |
 | Offset           | `-00:00:30`                    |
 | Rate sensor      | Your electricity rate entity   |
 
 Creates `binary_sensor.target_thermosync_evening`.
+
+### About the `-00:00:30` offset
+
+The 30-second negative offset ensures the TargetTimeframes binary
+sensor is firmly **on** before ThermoSync evaluates at the top of the
+hour. Without it, a window that nominally starts at 14:00 might flip
+on a fraction of a second *after* ThermoSync's 14:00:00 evaluation
+runs — causing the system to miss the first slot of a window and wait
+five more minutes until the next evaluation cycle.
 
 ### Adjusting window hours
 
@@ -170,11 +182,34 @@ only tops up by 10–15 °C, you can reduce the hours.
 Times shown are for winter worst-case (mains at ~8 °C, heating to
 ~55 °C). Summer heating is roughly 30–40% faster.
 
-### Intermittent vs Continuous
+### Intermittent vs Continuous — choose by hardware
 
-Use **Intermittent** for ThermoSync — it finds the cheapest individual
-half-hour slots (they don't need to be consecutive). Your tank's
-thermostat handles on/off cycling naturally.
+The TargetTimeframes integration offers two window types. Choose based
+on your heating hardware, not preference:
+
+**Immersion heaters → Use `Intermittent`.** The integration finds the
+absolute cheapest half-hour slots within the time band, even if those
+slots aren't consecutive. Resistive elements provide instant heat,
+handle cycling perfectly, and don't care whether they run for 30
+minutes straight or 15 minutes now and 15 minutes two hours later.
+`Intermittent` gives you the lowest unit cost.
+
+**Heat pumps → Use `Continuous`.** Heat pumps have long compressor
+startup times (often 5+ minutes before useful heat appears), must
+execute defrost cycles, and achieve peak thermodynamic efficiency only
+after sustained running. `Continuous` forces TargetTimeframes to find
+the cheapest **unbroken block** of time matching your hours setting —
+maximising the heat pump's COP and protecting the compressor from
+short-cycling damage. See also the "Heat Pump Minimum Run-Time" note
+in the Resilience Features section.
+
+> **Heat pump COP caveat.** ThermoSync optimises **unit price**, not
+> **thermodynamic efficiency**. Heating water to 65 °C with a heat pump
+> during a 10 p/kWh "cheap" window may cost more in real terms than
+> heating to 45 °C at 15 p/kWh, because heat pump COP collapses sharply
+> at high output temperatures. If you run a heat pump, keep
+> `max_temperature` and boosts moderate (e.g. 45–50 °C) and use
+> legionella protection sparingly.
 
 ### Without TargetTimeframes
 
@@ -216,6 +251,20 @@ before turning on.
 **Both modes** now always call `turn_on` on climate and water_heater
 entities when heating, ensuring the device is actually running — not
 just receiving a setpoint while physically switched off.
+
+> **Do not use Home Assistant `group` entities for Set-Temperature
+> mode.** Standard groups cannot accept `temperature` as a service
+> target, so `climate.set_temperature` calls will silently fail for
+> grouped heaters. Point ThermoSync at the individual heater entity.
+
+> **ThermoSync must be the ONLY automation controlling your heater.**
+> Separate "Away Mode", "Frost Protection", holiday schedules, or any
+> other automation that also writes to the heater will create race
+> conditions that bypass ThermoSync's dwell timer and relay protection
+> — potentially short-cycling the heater or producing inconsistent
+> setpoints. If you need frost protection or holiday behaviour, build
+> it on top of ThermoSync's helpers (the Enable/Disable switch and
+> Manual Boost) rather than as a parallel automation.
 
 ---
 
@@ -357,9 +406,9 @@ interval:
 
 | Phase | Condition | Behaviour |
 |-------|-----------|-----------|
-| **Ignore** | Less than `min_days` (default 5) since last cycle | Don't schedule. If the tank reaches 60 °C+ naturally (e.g. via negative-rate heating), it's recorded but doesn't reset the active scheduling clock. |
+| **Ignore** | Less than `min_days` (default 5) since last cycle | Don't actively schedule. If the tank reaches the pasteurisation threshold naturally (e.g. via negative-rate or solar heating), **the scheduling clock is reset** — the physical effect is the same as a scheduled cycle, so there's no safety reason to ignore it. |
 | **Opportunistic** | Between `min_days` and `max_days` (5–10) | Schedule a cycle when the rate drops below `legionella_price_threshold` (default 8 p). This finds a cheap window rather than heating at any price. |
-| **Forced** | More than `max_days` (default 10) without a cycle | Force a pasteurisation during the next overnight window regardless of price. Safety backstop. |
+| **Forced** | More than `max_days` (default 10) without a cycle | Force a pasteurisation during the **next active planned window** (overnight, midday, or evening — whichever fires first), regardless of price. Safety backstop. |
 
 ### Physical thermostat limits
 
@@ -381,19 +430,37 @@ ThermoSync handles this with a two-tier acceptance:
 
 ### Sensor placement for legionella
 
-ThermoSync relies on a single tank sensor to confirm pasteurisation.
-If the sensor is positioned **near the heating element**, it may
-register 60 °C+ while the rest of the tank volume hasn't reached that
-temperature — resulting in a false confirmation that doesn't actually
-kill bacteria throughout the tank.
+A single tank sensor cannot accurately monitor **both** depletion at
+the bottom **and** pasteurisation at the top. The two measurements
+want opposite placements:
 
-**Position the sensor at mid-tank or higher** for legionella purposes.
-This ensures the recorded temperature reflects the bulk of the stored
-water. If your sensor is near the bottom (common for depletion
-detection), consider adding a second sensor higher up and using it as
-the tank sensor for ThermoSync, or accept that the legionella cycle
-may need to run longer than theoretically necessary to ensure the
-mid/upper tank reaches temperature.
+- **Depletion detection** wants the sensor **low** on the tank, so it
+  reads cold mains water early as hot water is drawn off.
+- **Pasteurisation verification** wants the sensor **high** on the
+  tank, so it confirms the bulk of the stored water — not just the
+  zone nearest the heating element — has reached temperature.
+
+ThermoSync supports this trade-off in two ways:
+
+**Single-sensor setup (default).** Position the sensor at **mid-tank
+or higher**. This is a compromise: depletion will be detected slightly
+late (the tank is more drawn down when it reads cold), but legionella
+cycles won't produce false positives.
+
+**Dual-sensor setup (recommended where possible).** Keep your main
+tank sensor low (or mid-tank) for depletion detection, and add a
+second temperature sensor high on the tank. Assign the second sensor
+to **Legionella Verification Sensor** under the Legionella Protection
+section of the blueprint. ThermoSync will use the low sensor for
+depletion and control decisions, and the high sensor **only** to
+confirm a pasteurisation cycle has genuinely reached the top of the
+tank. If the verification sensor goes unavailable, ThermoSync falls
+back to using the main tank sensor.
+
+> **Never place a single tank sensor near the heating element.** It
+> will register 60 °C+ while the rest of the tank volume is still
+> well below pasteurisation temperature, producing a false confirmation
+> that doesn't actually kill bacteria throughout the stored water.
 
 ### How to enable
 
@@ -655,46 +722,87 @@ provides per-hour generation forecasts. After installation:
 
 ## Resilience Features
 
-### API outage protection
+### Sensor Outage (`unavailable` / `unknown`) vs Stale Data
 
-If the electricity rate sensor becomes `unavailable` or `unknown`, the
-rate defaults to **999 p/kWh** (not 0). This prevents the previous
-critical bug where an API outage would trigger negative-rate heating
-at full grid price.
+These are **two different failure modes** with different responses:
 
-Additionally, the negative-rate check requires both `rate_valid` AND
-`not rate_stale` — a sensor that stopped updating 30+ minutes ago
-cannot trigger negative-rate heating even if its last value was zero.
+**Sensor Outage — strict fail-safe.**
+If the **tank sensor** reports `unavailable` or `unknown`, ThermoSync
+refuses to heat. Operating blind is not safe: the system cannot tell
+whether the tank is at 20 °C or 80 °C.
+If the **electricity rate sensor** reports `unavailable` or `unknown`,
+the rate defaults to **999 p/kWh** (not 0). This prevents accidental
+negative-rate heating at full grid price during an API outage, and
+causes the system to fall back to planned windows at `base_temperature`
+only.
 
-### Stale data fallback
-
-If either the rate or tank sensor hasn't updated within the stale data
-threshold (default 30 minutes), ThermoSync enters **degraded mode**:
+**Stale Data — degraded mode.**
+If either sensor is still reporting a numeric value but hasn't updated
+its `last_updated` timestamp for longer than `stale_data_minutes`
+(default 30), ThermoSync enters **degraded mode**:
 
 - Heat only during planned TargetTimeframes windows
-- Target is base_temperature only (no demand or price boosts)
+- Target is `base_temperature` only (no demand or price boosts)
 - No negative-rate logic, no cheap-rate extension, no solar pricing
 - No deferral decisions
 
-This ensures the system doesn't make price-optimised decisions based
-on stale data, but still provides basic hot water via planned windows.
+This ensures the system doesn't make price-optimised decisions on
+stale data, but still delivers basic hot water via planned windows.
 
-### Relay protection
+Additionally, the negative-rate trigger requires both `rate_valid` AND
+`not rate_stale` — a sensor stuck at zero for 30+ minutes cannot cause
+negative-rate heating.
 
-Two mechanisms prevent physical relay damage:
+### Solar forecast zero-rollover grace period
 
-1. **Hysteresis (deadband)**: Default 2 °C. Heating stops at the
+At the top of each hour, forecast integrations like Forecast.Solar
+often set the current-hour sensor to 0 for a few seconds before the
+new forecast data populates. Without protection, both the current and
+next hour briefly read zero, the effective-rate calculation spikes,
+ThermoSync shuts off, and then turns back on five minutes later when
+the data repopulates — a wasted short cycle.
+
+ThermoSync detects this: during the **first 2 minutes** of any hour,
+if both solar sensors read exactly zero, the effective-rate calculation
+holds the previous value (by treating solar as 99 kWh available). This
+suppresses the false shut-off without affecting any other logic.
+
+### Relay and compressor protection
+
+Two mechanisms prevent physical hardware damage from rapid switching:
+
+1. **Hysteresis (deadband)** — default 2 °C. Heating stops at the
    target (e.g. 50 °C) and won't restart until the tank drops to 48 °C.
-   Within the deadband zone, ThermoSync maintains the heater's current
-   state rather than toggling.
+   Within the deadband, ThermoSync maintains the heater's current state
+   rather than toggling.
 
-2. **Minimum dwell time**: Default 5 minutes. The dwell timer only
-   gates turning heating **ON** — if the heater was off less than 5
-   minutes ago, ThermoSync won't restart it even if conditions change.
-   However, turning heating **OFF** or lowering a setpoint is always
-   immediate — safety and cost savings are never delayed by the dwell
-   timer. If the heater is already on and should continue heating,
-   dwell is also bypassed (no interruption to an active cycle).
+2. **Minimum dwell time** — default 5 minutes. The dwell timer gates
+   **both** state transitions: ThermoSync will not turn heating on if
+   it was last off less than 5 minutes ago, **and** will not turn
+   heating off if it was last on less than 5 minutes ago.
+
+   > **This is different from earlier versions.** Previously, shut-offs
+   > were immediate. That's fine for a resistive immersion element, but
+   > fatal for a heat pump: a compressor that starts up, reaches target
+   > 60 seconds later, and is shut down immediately will be destroyed.
+   > The bidirectional dwell timer now enforces minimum run-time and
+   > minimum rest-time, protecting both relays and compressors.
+
+### Heat pump minimum run-time (compressor protection)
+
+Heat pumps must run for a minimum time per cycle — usually 5–15 minutes
+depending on the model — to clear the refrigerant loop, execute any
+scheduled defrost, and recoup the compressor startup energy. Short
+cycling causes oil migration, mechanical wear, and premature failure.
+
+If you run a heat pump, set `min_cycle_minutes` to **at least your
+manufacturer's specified minimum run-time** (check your installer
+manual; 10 minutes is a reasonable default in the absence of a spec).
+Combined with `Continuous` TargetTimeframes windows, this keeps the
+compressor happy.
+
+For resistive immersion heaters, 5 minutes is fine — the dwell is
+mostly there to prevent relay chatter.
 
 ### HA restart safety
 
@@ -708,33 +816,95 @@ unnecessarily on every reboot.
 When the optional manual boost switch is turned on, ThermoSync heats
 to `max(max_temperature, negative_rate_temperature)` immediately,
 overriding peak blocks and all price logic. The switch auto-disables
-when the target is reached.
+when the target is reached **or if the tank sensor goes invalid**
+mid-boost — a dead sensor no longer leaves the boost latched on
+indefinitely.
+
+> **Latency note.** ThermoSync re-evaluates every 5 minutes (and
+> whenever the rate or tank sensor changes), so flipping the boost
+> helper can take up to 5 minutes to react. If you want near-instant
+> response — e.g. you trigger the boost from a dashboard button,
+> voice assistant, or the Octopus / manufacturer app — create a small
+> companion automation:
+>
+> ```yaml
+> alias: ThermoSync — instant boost trigger
+> triggers:
+>   - trigger: state
+>     entity_id: input_boolean.thermosync_manual_boost   # your helper
+>     to: "on"
+> actions:
+>   - action: automation.trigger
+>     target:
+>       entity_id: automation.thermosync   # your ThermoSync automation
+> ```
+>
+> This fires the ThermoSync evaluation the moment the helper turns on.
+> The same pattern works for the Enable/Disable switch if you want
+> instant pause/resume. Manufacturer-app or thermostat boost buttons
+> that talk directly to the heater don't need this — they bypass
+> ThermoSync entirely, and ThermoSync will simply observe the heater
+> state on its next evaluation cycle.
 
 ### Execution mode
 
-The automation uses `mode: queued` (max 3) instead of `restart`. This
-prevents a rapid sensor update from aborting a service call mid-
-execution — each trigger is processed in order rather than killing the
-previous one.
+The automation uses `mode: queued` (max 10) instead of `restart`. This
+prevents a rapid sensor update from aborting a service call
+mid-execution — each trigger is processed in order rather than
+killing the previous one. The queue depth of 10 comfortably absorbs
+bursts from simultaneous rate, tank, solar, and helper changes
+without dropping evaluations.
 
 ---
 
 ## Decision Priority Reference
 
+Two separate decisions run each evaluation: **should we heat?**
+(`should_heat_raw`) and **what target do we heat to?** (`active_target`).
+They're listed together here for clarity.
+
+### Should we heat? (evaluated top-down, first match wins)
+
 ```
 P0  Not enabled                            →  Do nothing
-P1  Manual boost on (+ tank sensor valid)  →  Heat to max(max_temp, neg_temp)
-P2  Tank sensor invalid                    →  Do nothing (fail safe)
-P3  Rate ≤ 0 AND valid AND not stale       →  Heat to negative_rate_temp
-P4  Tank ≤ depletion                       →  Emergency heat
-P5  Peak hours AND rate > threshold         →  Block heating
-P6  Solar exporting (valid, not degraded)  →  Heat to max(smart_target, solar_target)
-P7  Cheap rate AND no planned window soon  →  Heat to smart target
-P8  Planned window AND not deferring       →  Heat to smart target
+P1  Manual boost on AND tank sensor valid  →  Heat
+P2  Tank sensor invalid/unavailable        →  Do nothing (fail safe)
+P3  Rate ≤ 0 AND valid AND not stale       →  Heat (if tank < neg_temp)
+P4  Tank ≤ depletion threshold             →  Heat (emergency)
+P5  Peak hours AND rate > peak threshold   →  Block heating
+P6  Solar exporting AND not degraded       →  Heat
+P7  Cheap rate AND no window coming soon   →  Heat (if tank < smart_target)
+P8  Planned window AND not deferring       →  Heat (if tank < smart_target)
 P9  Data degraded AND planned window       →  Heat to base_temp only
-P10 Legionella due AND window active       →  Heat to legionella_temp
+P10 Legionella due AND window active       →  Heat (if tank < leg_temp)
 P11 Otherwise                              →  Don't heat
 ```
+
+### What target? (maximum of all applicable floors)
+
+The target temperature is the **maximum** of every currently active
+floor — emergency recovery and solar harvesting never cap each other,
+and solar can still be harvested while the tank is emptying:
+
+```
+base_floor  = manual_boost   → max(max_temp, neg_temp)
+              negative rate  → negative_rate_temp
+              legionella due → legionella_temp
+              data degraded  → base_temp
+              otherwise      → smart_target (base + demand + price boost)
+
+solar_floor = solar_target       (if solar_ok AND not degraded, else 0)
+emerg_floor = emergency_temp     (if tank ≤ depletion, else 0)
+
+active_target = max(base_floor, solar_floor, emerg_floor)
+```
+
+### Notes
+
+**Rate sensor fallback.** If the rate sensor is unavailable or invalid,
+`rate_pence` defaults to 999 p/kWh — never 0. This prevents any
+negative-rate trigger from firing during an API outage and causes the
+system to fall back to planned-window heating at `base_temp`.
 
 **Legionella scheduling** (P10) covers both opportunistic (min–max days
 + price + valid rate) and forced (overdue). Both require an active
@@ -747,8 +917,10 @@ configured, it still works using raw grid rates. Requires the
 next-hour rate sensor to be configured; otherwise deferral is disabled.
 
 All decisions are further gated by **hysteresis** (prevents re-engaging
-within the deadband), **dwell time** (prevents rapid relay cycling),
-and **sensor validity** (aborts if tank reading is non-numeric).
+within the deadband), **bidirectional dwell time** (prevents rapid
+cycling in either direction — protects both relays and heat pump
+compressors), and **sensor validity** (aborts if tank reading is
+non-numeric).
 
 ---
 
@@ -896,8 +1068,17 @@ more. This is your primary debugging tool.
 | overnight_boost | +5 °C | Extra for morning showers |
 | midday_boost | +3 °C | Extra for afternoon/evening |
 | evening_boost | +0 °C | Extra for last heat of day |
-| overnight_start/end | 22 / 7 | Period boundaries (wraps midnight) |
+| overnight_start/end | 22 / 7 | Period boundaries (wraps midnight; set start == end to disable the overnight slot) |
 | midday_start/end | 9 / 16 | Period boundaries |
+
+> **Seasonal adjustments.** Mains water is significantly colder in
+> winter (6–10 °C) than in summer (15–18 °C), so a full tank heat-up
+> needs more energy at the same target temperature. You may need to
+> increase your `demand_boost` values or widen your TargetTimeframes
+> windows during winter months to achieve the same usable volume of
+> hot water. In summer, the tank simply reaches target sooner and
+> ThermoSync stops — no energy is wasted by leaving winter-sized
+> settings in place year-round.
 
 ### Price Thresholds
 | Input | Default | Description |
@@ -926,6 +1107,7 @@ more. This is your primary debugging tool.
 | legionella_max_days | 10 | Force cycle after this (safety) |
 | legionella_price_threshold | 8 p | Schedule when rate below this |
 | legionella_temperature | 65 °C | Target (accepted within 3 °C or ≥60 °C) |
+| legionella_temperature_sensor | *(empty)* | Optional high-mounted sensor used only to verify pasteurisation; falls back to main tank sensor |
 
 ### Resilience & Safety
 | Input | Default | Description |
