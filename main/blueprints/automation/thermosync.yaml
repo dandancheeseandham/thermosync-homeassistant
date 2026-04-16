@@ -1,0 +1,997 @@
+blueprint:
+  name: "ThermoSync — Smart Hot Water Optimizer"
+  description: >
+    ThermoSync treats your hot water tank as a thermal battery — pre-heats
+    during the cheapest electricity windows (or free solar), and coasts
+    through expensive periods. Designed for variable-rate tariffs (Octopus
+    Agile, Tibber, Intelligent Go, Cosy, etc.) but works with any sensor
+    that provides a live electricity rate.
+
+
+    SAFETY-FIRST DEFAULTS: out of the box, ThermoSync will not heat water
+    above 50 C and treats sensor outages as "do not heat". Legionella
+    protection is disabled by default and requires an explicit opt-in.
+
+
+    See the README for full setup, TargetTimeframes configuration,
+    household profiles, and tuning guidance.
+
+  domain: automation
+  source_url: "https://github.com/dandancheeseandham/thermosync-homeassistant/blob/main/blueprints/automation/thermosync.yaml"
+  homeassistant:
+    min_version: "2024.6.0"
+
+  input:
+    core:
+      name: "Core Configuration"
+      icon: "mdi:water-boiler"
+      collapsed: false
+      input:
+        tank_temperature_sensor:
+          name: "Tank Temperature Sensor"
+          description: >
+            Sensor that reads your hot water tank temperature.
+          selector:
+            entity:
+              domain: sensor
+              device_class: temperature
+
+        electricity_rate_sensor:
+          name: "Electricity Rate Sensor"
+          description: >
+            Sensor providing your current electricity unit rate.
+            Octopus Energy reads in GBP/kWh - set multiplier to 100.
+          selector:
+            entity:
+              domain: sensor
+
+        rate_multiplier:
+          name: "Rate multiplier (to pence)"
+          description: "Octopus Energy (GBP/kWh) = 100. Already in p/kWh = 1."
+          default: 100
+          selector:
+            number:
+              min: 1
+              max: 1000
+              step: 1
+              mode: box
+
+        hot_water_heater:
+          name: "Hot Water Heater Entity"
+          selector:
+            entity:
+              domain:
+                - climate
+                - water_heater
+                - switch
+                - input_boolean
+
+        control_mode:
+          name: "Control Mode"
+          description: >
+            Set temperature - writes high/low target, entity stays on.
+            On/Off - turns entity on to heat and off to stop.
+          default: "set_temperature"
+          selector:
+            select:
+              options:
+                - label: "Set temperature (high to heat, low to idle)"
+                  value: "set_temperature"
+                - label: "On / Off (turn entity on and off)"
+                  value: "on_off"
+
+        idle_temperature:
+          name: "Idle Temperature (Set-temperature mode only)"
+          default: 10
+          selector:
+            number:
+              min: 0
+              max: 30
+              step: 1
+              unit_of_measurement: "°C"
+              mode: box
+
+    schedule:
+      name: "Schedule Windows (TargetTimeframes)"
+      icon: "mdi:calendar-clock"
+      description: >
+        IMPORTANT: Size windows for WINTER conditions. Cold mains water
+        (6-10 C) needs significantly longer heating than summer (15-18 C).
+        A window that works in July may fail in January. Set hours for
+        worst case - in summer the tank reaches target sooner and
+        ThermoSync stops, wasting no energy.
+      collapsed: false
+      input:
+        overnight_window:
+          name: "Overnight Window"
+          description: >
+            Pre-heat for morning showers. Suggested: hours=2.0
+            (winter-sized), start=22:00, end=07:00, type=Intermittent.
+          default: []
+          selector:
+            entity:
+              domain: binary_sensor
+              multiple: false
+        midday_window:
+          name: "Midday Window"
+          description: >
+            Top-up before evening peak. Suggested: hours=1.5
+            (winter-sized), start=09:00, end=15:30, type=Intermittent.
+          default: []
+          selector:
+            entity:
+              domain: binary_sensor
+              multiple: false
+        evening_window:
+          name: "Evening Window"
+          description: >
+            Last top-up. Suggested: hours=1.5 (winter-sized),
+            start=19:00, end=22:00, type=Intermittent.
+          default: []
+          selector:
+            entity:
+              domain: binary_sensor
+              multiple: false
+
+    solar:
+      name: "Solar Diversion (Optional)"
+      icon: "mdi:solar-power"
+      description: >
+        Uses excess solar to heat water. Validates export sensor sign -
+        must read NEGATIVE when exporting. Leave empty to disable.
+      collapsed: true
+      input:
+        grid_sensor:
+          name: "Grid Import / Export Sensor"
+          description: >
+            Must read NEGATIVE when exporting. ThermoSync auto-detects
+            whether your sensor reads in W or kW using its
+            unit_of_measurement attribute — no manual conversion needed.
+          default: []
+          selector:
+            entity:
+              domain: sensor
+              multiple: false
+        solar_forecast_sensor:
+          name: "Solar Forecast - Next Hour (kWh)"
+          default: []
+          selector:
+            entity:
+              domain: sensor
+              multiple: false
+        current_hour_solar_sensor:
+          name: "Solar Forecast - Current Hour (kWh)"
+          description: "For effective-rate calculation. Leave empty to disable."
+          default: []
+          selector:
+            entity:
+              domain: sensor
+              multiple: false
+        solar_export_threshold:
+          name: "Export Threshold"
+          default: 0.5
+          selector:
+            number:
+              min: 0.1
+              max: 5.0
+              step: 0.1
+              unit_of_measurement: "kW"
+              mode: box
+        solar_forecast_threshold:
+          name: "Forecast Threshold"
+          default: 1.0
+          selector:
+            number:
+              min: 0
+              max: 10
+              step: 0.5
+              unit_of_measurement: "kWh"
+              mode: box
+        solar_target_temp:
+          name: "Solar Target Temperature"
+          default: 50
+          selector:
+            number:
+              min: 40
+              max: 70
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+
+    temperatures:
+      name: "Temperature Settings"
+      icon: "mdi:thermometer"
+      collapsed: true
+      input:
+        base_temperature:
+          name: "Base Temperature"
+          description: "Default 45 + default boosts = 50 C max (safe)."
+          default: 45
+          selector:
+            number:
+              min: 40
+              max: 65
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        max_temperature:
+          name: "Maximum Temperature"
+          description: >
+            Maximum normal target for planned windows and cheap-rate
+            heating. Can be exceeded by negative-rate heating, solar
+            diversion (uses max of smart target and solar target),
+            manual boost, and legionella cycles — each of which has
+            its own separate temperature setting. Only raise above
+            50 with TMVs fitted.
+          default: 50
+          selector:
+            number:
+              min: 40
+              max: 80
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        negative_rate_temperature:
+          name: "Negative Rate Temperature"
+          description: "Target when paid to consume. Safe default 50 C."
+          default: 50
+          selector:
+            number:
+              min: 40
+              max: 85
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        emergency_temperature:
+          name: "Emergency Recovery Temperature"
+          default: 50
+          selector:
+            number:
+              min: 40
+              max: 65
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        depletion_threshold:
+          name: "Tank Depletion Threshold"
+          description: >
+            Set to about one shower left, NOT fully empty. By the time
+            sensor reads mains temp, the household has already had
+            minutes of cold water. Run water until tepid, note the
+            reading, use that.
+          default: 23
+          selector:
+            number:
+              min: 5
+              max: 40
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        hysteresis:
+          name: "Hysteresis (deadband)"
+          description: >
+            Degrees below target before re-engaging. Prevents relay
+            chatter. At 2: stops at 50, restarts at 48.
+          default: 2
+          selector:
+            number:
+              min: 0.5
+              max: 10
+              step: 0.5
+              unit_of_measurement: "°C"
+              mode: slider
+
+    demand:
+      name: "Demand Profile"
+      icon: "mdi:shower-head"
+      collapsed: true
+      input:
+        overnight_boost:
+          name: "Overnight Demand Boost"
+          description: "Default +5 with base 45 = 50 C (safe cap)."
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 15
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        midday_boost:
+          name: "Midday Demand Boost"
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 15
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        evening_boost:
+          name: "Evening Demand Boost"
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 15
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        overnight_start_hour:
+          name: "Overnight start hour"
+          description: "Wraps past midnight (e.g. 22 to 7)."
+          default: 22
+          selector:
+            number:
+              min: 0
+              max: 23
+              step: 1
+              mode: box
+        overnight_end_hour:
+          name: "Overnight end hour"
+          default: 7
+          selector:
+            number:
+              min: 0
+              max: 23
+              step: 1
+              mode: box
+        midday_start_hour:
+          name: "Midday start hour"
+          default: 9
+          selector:
+            number:
+              min: 0
+              max: 23
+              step: 1
+              mode: box
+        midday_end_hour:
+          name: "Midday end hour"
+          default: 16
+          selector:
+            number:
+              min: 0
+              max: 23
+              step: 1
+              mode: box
+
+    pricing:
+      name: "Price Thresholds"
+      icon: "mdi:currency-gbp"
+      collapsed: true
+      input:
+        cheap_rate_threshold:
+          name: "Cheap Rate Threshold"
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 50
+              step: 0.5
+              unit_of_measurement: "p/kWh"
+              mode: box
+        very_cheap_threshold:
+          name: "Very Cheap Rate Threshold"
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 20
+              step: 0.5
+              unit_of_measurement: "p/kWh"
+              mode: box
+        very_cheap_bonus:
+          name: "Very Cheap Rate Bonus"
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 15
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        moderate_cheap_bonus:
+          name: "Moderate Cheap Rate Bonus"
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 10
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+        peak_start_hour:
+          name: "Peak start hour"
+          description: "Wraps past midnight (e.g. 22 to 2)."
+          default: 16
+          selector:
+            number:
+              min: 0
+              max: 23
+              step: 1
+              mode: box
+        peak_end_hour:
+          name: "Peak end hour"
+          default: 19
+          selector:
+            number:
+              min: 0
+              max: 23
+              step: 1
+              mode: box
+        peak_rate_threshold:
+          name: "Peak Block Threshold"
+          default: 15
+          selector:
+            number:
+              min: 0
+              max: 100
+              step: 1
+              unit_of_measurement: "p/kWh"
+              mode: box
+
+    advanced_price:
+      name: "Advanced Price Logic"
+      icon: "mdi:chart-line"
+      collapsed: true
+      input:
+        cheap_rate_lookahead_hours:
+          name: "Cheap Rate Look-Ahead"
+          description: "Skip cheap-rate extension if planned window starts within this."
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 12
+              step: 0.5
+              unit_of_measurement: "h"
+              mode: slider
+        next_hour_rate_sensor:
+          name: "Next Hour Rate Sensor (Optional)"
+          default: []
+          selector:
+            entity:
+              domain: sensor
+              multiple: false
+        base_house_load:
+          name: "Base House Load"
+          description: "Typical baseline draw excl. heater (kW). UK home: 0.2-0.5."
+          default: 0.3
+          selector:
+            number:
+              min: 0
+              max: 3
+              step: 0.1
+              unit_of_measurement: "kW"
+              mode: box
+        heater_power_kw:
+          name: "Heater Power"
+          default: 3
+          selector:
+            number:
+              min: 0.5
+              max: 15
+              step: 0.5
+              unit_of_measurement: "kW"
+              mode: box
+        defer_threshold_percent:
+          name: "Defer if Next Hour Cheaper by"
+          default: 20
+          selector:
+            number:
+              min: 5
+              max: 100
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+
+    legionella:
+      name: "Legionella Protection"
+      icon: "mdi:shield-check"
+      description: >
+        WARNING SCALDING RISK - LEGIONELLA PROTECTION HEATS THE TANK
+        TO 60 C OR HIGHER. WATER AT 60 C CAUSES FULL-THICKNESS BURNS
+        IN UNDER 5 SECONDS. ONLY ENABLE IF EVERY OUTLET HAS A
+        THERMOSTATIC MIXING VALVE (TMV). LEAVE TRACKER EMPTY TO
+        DISABLE (DEFAULT).
+      collapsed: true
+      input:
+        legionella_tracker:
+          name: "Legionella Cycle Tracker"
+          description: "An input_datetime helper. LEAVE EMPTY TO DISABLE."
+          default: []
+          selector:
+            entity:
+              domain: input_datetime
+              multiple: false
+        legionella_min_days:
+          name: "Minimum Cycle Interval"
+          description: "Don't actively schedule sooner than this."
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 14
+              step: 1
+              unit_of_measurement: "days"
+              mode: box
+        legionella_max_days:
+          name: "Maximum Cycle Interval (safety limit)"
+          description: "Force a cycle during the next overnight window."
+          default: 10
+          selector:
+            number:
+              min: 3
+              max: 21
+              step: 1
+              unit_of_measurement: "days"
+              mode: box
+        legionella_price_threshold:
+          name: "Legionella Price Threshold"
+          description: "Between min/max interval, schedule when rate below this."
+          default: 8
+          selector:
+            number:
+              min: 0
+              max: 50
+              step: 1
+              unit_of_measurement: "p/kWh"
+              mode: box
+        legionella_temperature:
+          name: "Pasteurisation Temperature"
+          description: >
+            Target temperature for a legionella cycle. ThermoSync
+            accepts the cycle if the tank reaches within 3 C of this
+            target, OR if it reaches 60 C while actively trying
+            (handles physical thermostats that cut before the target).
+            If your immersion thermostat is set to e.g. 63 C, set
+            this to 63 C rather than fighting the physical limit.
+          default: 65
+          selector:
+            number:
+              min: 60
+              max: 75
+              step: 1
+              unit_of_measurement: "°C"
+              mode: slider
+
+    resilience:
+      name: "Resilience & Safety"
+      icon: "mdi:shield-alert"
+      description: "Handles sensor failures, stale data, relay protection."
+      collapsed: true
+      input:
+        stale_data_minutes:
+          name: "Stale Data Threshold"
+          description: >
+            If rate or tank sensor not updated within this many minutes,
+            fall back to conservative baseline. Prevents heating at
+            phantom prices from a failed API.
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 120
+              step: 5
+              unit_of_measurement: "min"
+              mode: box
+        min_cycle_minutes:
+          name: "Minimum On/Off Dwell Time"
+          description: "Minimum minutes in same state before changing. Protects relays."
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 30
+              step: 1
+              unit_of_measurement: "min"
+              mode: box
+        manual_boost:
+          name: "Manual Boost Override Switch"
+          description: >
+            Optional input_boolean. When on, heats to the HIGHER of
+            max_temperature or negative_rate_temperature immediately,
+            overriding peak blocks and all price logic. Auto-disables
+            when target reached. Requires a valid tank sensor to
+            operate. Leave empty to disable.
+          default: []
+          selector:
+            entity:
+              domain: input_boolean
+              multiple: false
+        enable_switch:
+          name: "Enable / Disable Switch"
+          description: "Optional input_boolean to pause ThermoSync."
+          default: []
+          selector:
+            entity:
+              domain: input_boolean
+              multiple: false
+
+mode: queued
+max_exceeded: silent
+max: 3
+
+trigger:
+  - id: "periodic"
+    platform: time_pattern
+    minutes: "/5"
+  - id: "rate_change"
+    platform: state
+    entity_id: !input electricity_rate_sensor
+  - id: "tank_change"
+    platform: state
+    entity_id: !input tank_temperature_sensor
+  - id: "ha_start"
+    platform: homeassistant
+    event: start
+
+action:
+  - if:
+      - condition: trigger
+        id: "ha_start"
+    then:
+      - delay: "00:00:30"
+
+  - variables:
+      tank_sensor: !input tank_temperature_sensor
+      rate_sensor: !input electricity_rate_sensor
+      rate_mult: !input rate_multiplier
+      heater: !input hot_water_heater
+      ctrl_mode: !input control_mode
+      idle_temp: !input idle_temperature
+      win_overnight: !input overnight_window
+      win_midday: !input midday_window
+      win_evening: !input evening_window
+      grid_sensor: !input grid_sensor
+      forecast_sensor: !input solar_forecast_sensor
+      current_solar_sensor: !input current_hour_solar_sensor
+      solar_exp_thresh: !input solar_export_threshold
+      solar_fc_thresh: !input solar_forecast_threshold
+      solar_target: !input solar_target_temp
+      base_temp: !input base_temperature
+      max_temp: !input max_temperature
+      neg_temp: !input negative_rate_temperature
+      emerg_temp: !input emergency_temperature
+      depletion: !input depletion_threshold
+      deadband: !input hysteresis
+      boost_overnight: !input overnight_boost
+      boost_midday: !input midday_boost
+      boost_evening: !input evening_boost
+      overnight_s: !input overnight_start_hour
+      overnight_e: !input overnight_end_hour
+      midday_s: !input midday_start_hour
+      midday_e: !input midday_end_hour
+      cheap_thresh: !input cheap_rate_threshold
+      vcheap_thresh: !input very_cheap_threshold
+      vcheap_bonus: !input very_cheap_bonus
+      mod_bonus: !input moderate_cheap_bonus
+      peak_s: !input peak_start_hour
+      peak_e: !input peak_end_hour
+      peak_thresh: !input peak_rate_threshold
+      lookahead_hours: !input cheap_rate_lookahead_hours
+      next_rate_sensor: !input next_hour_rate_sensor
+      base_load: !input base_house_load
+      heater_kw: !input heater_power_kw
+      defer_pct: !input defer_threshold_percent
+      leg_tracker: !input legionella_tracker
+      leg_min_days: !input legionella_min_days
+      leg_max_days: !input legionella_max_days
+      leg_price: !input legionella_price_threshold
+      leg_temp: !input legionella_temperature
+      stale_mins: !input stale_data_minutes
+      dwell_mins: !input min_cycle_minutes
+      manual_sw: !input manual_boost
+      enable_sw: !input enable_switch
+
+  - variables:
+      rate_raw: "{{ states(rate_sensor) }}"
+      rate_valid: >
+        {{ rate_raw not in ['unavailable', 'unknown', 'none', '']
+           and rate_raw is not none
+           and (rate_raw | is_number) }}
+      tank_raw: "{{ states(tank_sensor) }}"
+      tank_valid: >
+        {{ tank_raw not in ['unavailable', 'unknown', 'none', '']
+           and tank_raw is not none
+           and (tank_raw | is_number) }}
+      rate_stale: >
+        {% if not rate_valid %}true
+        {% else %}
+          {% set last = states[rate_sensor].last_updated %}
+          {{ (as_timestamp(now()) - as_timestamp(last)) > (stale_mins * 60) }}
+        {% endif %}
+      tank_stale: >
+        {% if not tank_valid %}true
+        {% else %}
+          {% set last = states[tank_sensor].last_updated %}
+          {{ (as_timestamp(now()) - as_timestamp(last)) > (stale_mins * 60) }}
+        {% endif %}
+      data_degraded: "{{ rate_stale or tank_stale }}"
+      rate_pence: >
+        {% if rate_valid %}{{ (rate_raw | float(999)) * rate_mult }}
+        {% else %}999{% endif %}
+      tank_temp: >
+        {% if tank_valid %}{{ tank_raw | float(30) }}{% else %}30{% endif %}
+      hour: "{{ now().hour }}"
+      enabled: >
+        {% if enable_sw in ['', none, []] %}true
+        {% else %}{{ is_state(enable_sw, 'on') }}{% endif %}
+      manual_boost_on: >
+        {% if manual_sw in ['', none, []] %}false
+        {% else %}{{ is_state(manual_sw, 'on') }}{% endif %}
+      is_peak: >
+        {% if peak_s > peak_e %}{{ hour >= peak_s or hour < peak_e }}
+        {% else %}{{ hour >= peak_s and hour < peak_e }}{% endif %}
+      window_active: >
+        {% set w1 = win_overnight not in ['', none, []] and is_state(win_overnight, 'on') %}
+        {% set w2 = win_midday not in ['', none, []] and is_state(win_midday, 'on') %}
+        {% set w3 = win_evening not in ['', none, []] and is_state(win_evening, 'on') %}
+        {{ w1 or w2 or w3 }}
+      solar_ok: >
+        {% if grid_sensor in ['', none, []] %}false
+        {% else %}
+          {% set gr = states(grid_sensor) %}
+          {% if gr in ['unavailable', 'unknown', 'none', ''] %}false
+          {% else %}
+            {% set grid_raw = gr | float(0) %}
+            {% set uom = state_attr(grid_sensor, 'unit_of_measurement') | default('kW') %}
+            {% set grid_kw = grid_raw / 1000 if uom == 'W' else grid_raw %}
+            {% set exporting = grid_kw < (solar_exp_thresh * -1) %}
+            {% set fc_ok = true %}
+            {% if forecast_sensor not in ['', none, []] %}
+              {% set fv = states(forecast_sensor) %}
+              {% if fv in ['unavailable', 'unknown'] %}{% set fc_ok = false %}
+              {% else %}
+                {% set nv = 0 %}
+                {% if current_solar_sensor not in ['', none, []] %}
+                  {% set cv = states(current_solar_sensor) %}
+                  {% if cv not in ['unavailable', 'unknown'] %}
+                    {% set nv = cv | float(0) %}
+                  {% endif %}
+                {% endif %}
+                {% set smoothed = [fv | float(0), nv] | max %}
+                {% set fc_ok = smoothed >= solar_fc_thresh %}
+              {% endif %}
+            {% endif %}
+            {{ exporting and fc_ok and tank_temp < solar_target }}
+          {% endif %}
+        {% endif %}
+      current_solar_kwh: >
+        {% set curr = 0 %}
+        {% set nxt = 0 %}
+        {% if current_solar_sensor not in ['', none, []] %}
+          {% set v = states(current_solar_sensor) %}
+          {% if v not in ['unavailable', 'unknown'] %}{% set curr = v | float(0) %}{% endif %}
+        {% endif %}
+        {% if forecast_sensor not in ['', none, []] %}
+          {% set v = states(forecast_sensor) %}
+          {% if v not in ['unavailable', 'unknown'] %}{% set nxt = v | float(0) %}{% endif %}
+        {% endif %}
+        {{ [curr, nxt] | max }}
+      next_solar_kwh: >
+        {% if forecast_sensor in ['', none, []] %}0
+        {% else %}{% set v = states(forecast_sensor) %}
+          {% if v in ['unavailable', 'unknown'] %}0{% else %}{{ v | float(0) }}{% endif %}
+        {% endif %}
+      next_rate_pence: >
+        {% if next_rate_sensor in ['', none, []] %}{{ rate_pence }}
+        {% else %}{% set v = states(next_rate_sensor) %}
+          {% if v in ['unavailable', 'unknown'] %}{{ rate_pence }}
+          {% else %}{{ (v | float(0)) * rate_mult }}{% endif %}
+        {% endif %}
+      effective_rate_now: >
+        {% set net = [0, (current_solar_kwh|float) - (base_load|float)] | max %}
+        {% set cov = [1, net / (heater_kw|float)] | min %}
+        {{ (rate_pence|float) * (1 - cov) }}
+      effective_rate_next: >
+        {% set net = [0, (next_solar_kwh|float) - (base_load|float)] | max %}
+        {% set cov = [1, net / (heater_kw|float)] | min %}
+        {{ (next_rate_pence|float) * (1 - cov) }}
+      cheap_active: >
+        {{ (effective_rate_now|float) < cheap_thresh
+           and not is_peak and tank_temp < max_temp and not data_degraded }}
+      planned_window_coming_soon: >
+        {% set ns = namespace(found=false) %}
+        {% if (lookahead_hours|float) > 0 %}
+          {% set cutoff = (lookahead_hours|float) * 3600 %}
+          {% for w in [win_overnight, win_midday, win_evening] %}
+            {% if w not in ['', none, []] %}
+              {% set nt = state_attr(w, 'next_time') %}
+              {% if nt is not none %}
+                {% set secs = as_timestamp(nt) - as_timestamp(now()) %}
+                {% if secs > 0 and secs <= cutoff %}{% set ns.found = true %}{% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+        {{ ns.found }}
+      should_defer: >
+        {% if next_rate_sensor in ['', none, []] %}false
+        {% elif tank_temp < (depletion + 10) %}false
+        {% elif data_degraded %}false
+        {% else %}
+          {% set now_eff = effective_rate_now|float %}
+          {% set next_eff = effective_rate_next|float %}
+          {% if now_eff <= 0 %}false
+          {% else %}{{ ((now_eff - next_eff) / now_eff * 100) >= (defer_pct|float) }}{% endif %}
+        {% endif %}
+      demand_boost: >
+        {% if overnight_s > overnight_e %}
+          {% if hour >= overnight_s or hour < overnight_e %}{{ boost_overnight }}
+          {% elif hour >= midday_s and hour < midday_e %}{{ boost_midday }}
+          {% else %}{{ boost_evening }}{% endif %}
+        {% else %}
+          {% if hour >= overnight_s and hour < overnight_e %}{{ boost_overnight }}
+          {% elif hour >= midday_s and hour < midday_e %}{{ boost_midday }}
+          {% else %}{{ boost_evening }}{% endif %}
+        {% endif %}
+      price_boost: >
+        {% if rate_pence <= 0 and rate_valid and not rate_stale %}15
+        {% elif rate_pence < vcheap_thresh %}{{ vcheap_bonus }}
+        {% elif rate_pence < cheap_thresh %}{{ mod_bonus }}
+        {% else %}0{% endif %}
+      smart_target: >
+        {% set t = base_temp + (demand_boost|float(0)) + (price_boost|float(0)) %}
+        {{ [[t, base_temp] | max, max_temp] | min }}
+      leg_days_since: >
+        {% if leg_tracker in ['', none, []] %}-1
+        {% else %}{% set last = states(leg_tracker) %}
+          {% if last in ['unknown', 'unavailable', '', none] %}999
+          {% else %}{{ ((as_timestamp(now()) - as_timestamp(last)) / 86400)|round(1) }}{% endif %}
+        {% endif %}
+      leg_enabled: "{{ (leg_days_since|float) >= 0 }}"
+      leg_overdue_forced: "{{ leg_enabled and (leg_days_since|float) >= leg_max_days }}"
+      leg_due_opportunistic: >
+        {{ leg_enabled and (leg_days_since|float) >= leg_min_days
+           and (leg_days_since|float) < leg_max_days
+           and rate_pence <= leg_price
+           and rate_valid and not rate_stale }}
+      needs_legionella: "{{ leg_overdue_forced or leg_due_opportunistic }}"
+      secs_since_change: >
+        {{ as_timestamp(now()) - as_timestamp(
+           states[heater].last_changed | default(0)) }}
+      dwell_elapsed: >
+        {{ (secs_since_change | float(999)) >= (dwell_mins * 60) }}
+      heater_currently_on: >
+        {{ not is_state(heater, 'off')
+           and not is_state(heater, 'unavailable')
+           and not is_state(heater, 'unknown') }}
+      dwell_ok: >
+        {% if not should_heat %}true
+        {% elif heater_currently_on %}true
+        {% else %}{{ dwell_elapsed }}{% endif %}
+      should_heat_raw: >
+        {% if not enabled %}false
+        {% elif manual_boost_on and tank_valid %}true
+        {% elif not tank_valid %}false
+        {% elif rate_pence <= 0 and rate_valid and not rate_stale and tank_temp < neg_temp %}true
+        {% elif tank_temp <= depletion %}true
+        {% elif is_peak and rate_pence > peak_thresh and not manual_boost_on %}false
+        {% elif solar_ok and not data_degraded %}true
+        {% elif cheap_active and not planned_window_coming_soon and tank_temp < (smart_target|float) %}true
+        {% elif window_active and not should_defer and tank_temp < (smart_target|float) %}true
+        {% elif data_degraded and window_active and tank_temp < base_temp %}true
+        {% elif needs_legionella and window_active and tank_temp < leg_temp %}true
+        {% else %}false{% endif %}
+      active_target: >
+        {% if manual_boost_on %}{{ [max_temp, neg_temp] | max }}
+        {% elif rate_pence <= 0 and rate_valid and not rate_stale %}{{ neg_temp }}
+        {% elif tank_temp <= depletion %}{{ emerg_temp }}
+        {% elif solar_ok %}{{ [smart_target|float, solar_target|float] | max }}
+        {% elif needs_legionella %}{{ leg_temp }}
+        {% elif data_degraded %}{{ base_temp }}
+        {% else %}{{ smart_target }}{% endif %}
+      should_heat: >
+        {% if not should_heat_raw %}false
+        {% elif tank_temp <= depletion %}true
+        {% elif manual_boost_on %}true
+        {% elif tank_temp >= ((active_target|float) - 0.5) %}false
+        {% elif tank_temp > ((active_target|float) - deadband) %}{{ not is_state(heater, 'off') }}
+        {% else %}true{% endif %}
+      heater_domain: "{{ heater.split('.')[0] }}"
+
+  - condition: template
+    value_template: "{{ dwell_ok }}"
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ should_heat }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ heater_domain == 'climate' }}"
+                sequence:
+                  - service: climate.set_temperature
+                    target:
+                      entity_id: "{{ heater }}"
+                    data:
+                      temperature: "{{ active_target|float }}"
+                  - service: climate.turn_on
+                    target:
+                      entity_id: "{{ heater }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ heater_domain == 'water_heater' }}"
+                sequence:
+                  - service: water_heater.set_temperature
+                    target:
+                      entity_id: "{{ heater }}"
+                    data:
+                      temperature: "{{ active_target|float }}"
+                  - service: water_heater.turn_on
+                    target:
+                      entity_id: "{{ heater }}"
+            default:
+              - service: homeassistant.turn_on
+                target:
+                  entity_id: "{{ heater }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ not should_heat }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ heater_domain == 'climate' and ctrl_mode == 'set_temperature' }}"
+                sequence:
+                  - service: climate.set_temperature
+                    target:
+                      entity_id: "{{ heater }}"
+                    data:
+                      temperature: "{{ idle_temp|float }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ heater_domain == 'climate' and ctrl_mode == 'on_off' }}"
+                sequence:
+                  - service: climate.turn_off
+                    target:
+                      entity_id: "{{ heater }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ heater_domain == 'water_heater' and ctrl_mode == 'set_temperature' }}"
+                sequence:
+                  - service: water_heater.set_temperature
+                    target:
+                      entity_id: "{{ heater }}"
+                    data:
+                      temperature: "{{ idle_temp|float }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ heater_domain == 'water_heater' and ctrl_mode == 'on_off' }}"
+                sequence:
+                  - service: water_heater.turn_off
+                    target:
+                      entity_id: "{{ heater }}"
+            default:
+              - service: homeassistant.turn_off
+                target:
+                  entity_id: "{{ heater }}"
+
+  - if:
+      - condition: template
+        value_template: >
+          {% if leg_tracker in ['', none, []] %}false
+          {% else %}
+            {% set margin = 3 %}
+            {% set target_met = tank_temp >= ((leg_temp|float) - margin) %}
+            {% set above_60 = tank_temp >= 60 %}
+            {{ target_met or (above_60 and needs_legionella) }}
+          {% endif %}
+    then:
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: "{{ leg_tracker }}"
+        data:
+          datetime: "{{ now().isoformat() }}"
+
+  - if:
+      - condition: template
+        value_template: >
+          {{ manual_boost_on and tank_temp >= ((active_target|float) - 0.5) }}
+    then:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: "{{ manual_sw }}"
