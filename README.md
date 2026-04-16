@@ -46,7 +46,7 @@ back to planned TargetTimeframes windows at `base_temperature` only.
 
 ### Step 1 — Install the blueprint
 
-[![Open your Home Assistant instance and import this blueprint.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https://github.com/ha-community/thermosync/blob/main/blueprints/automation/thermosync.yaml)
+[![Open your Home Assistant instance and import this blueprint.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=[https://github.com/ha-community/thermosync/blob/main/blueprints/automation/thermosync.yaml](https://github.com/ha-community/thermosync/blob/main/blueprints/automation/thermosync.yaml))
 
 Or manually: copy `thermosync.yaml` into
 `config/blueprints/automation/thermosync/`
