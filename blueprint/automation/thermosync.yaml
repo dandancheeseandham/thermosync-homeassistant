@@ -9,15 +9,17 @@ blueprint:
 
 
     SAFETY-FIRST DEFAULTS: out of the box, ThermoSync will not heat water
-    above 50 C and treats sensor outages as "do not heat". Legionella
-    protection is disabled by default and requires an explicit opt-in.
+    above 50 C. Tank sensor failures strictly stop heating, while rate
+    sensor failures fall back to conservative planned-window heating.
+    Legionella protection is disabled by default and requires an
+    explicit opt-in.
 
 
     See the README for full setup, TargetTimeframes configuration,
     household profiles, and tuning guidance.
 
   domain: automation
-  source_url: "https://raw.githubusercontent.com/dandancheeseandham/thermosync-homeassistant/refs/heads/main/blueprint/automation/thermosync.yaml"
+  source_url: "https://github.com/ha-community/thermosync/blob/main/blueprints/automation/thermosync.yaml"
   homeassistant:
     min_version: "2024.6.0"
 
@@ -58,6 +60,9 @@ blueprint:
 
         hot_water_heater:
           name: "Hot Water Heater Entity"
+          description: >
+            Do not use HA 'group' entities for Set-Temperature mode, as
+            temperature targets cannot be passed to standard groups.
           selector:
             entity:
               domain:
@@ -106,7 +111,8 @@ blueprint:
           name: "Overnight Window"
           description: >
             Pre-heat for morning showers. Suggested: hours=2.0
-            (winter-sized), start=22:00, end=07:00, type=Intermittent.
+            (winter-sized), start=22:00, end=07:00. Type: Intermittent
+            for Immersion, Continuous for Heat Pumps.
           default: []
           selector:
             entity:
@@ -116,7 +122,8 @@ blueprint:
           name: "Midday Window"
           description: >
             Top-up before evening peak. Suggested: hours=1.5
-            (winter-sized), start=09:00, end=15:30, type=Intermittent.
+            (winter-sized), start=09:00, end=15:30. Type: Intermittent
+            for Immersion, Continuous for Heat Pumps.
           default: []
           selector:
             entity:
@@ -126,7 +133,8 @@ blueprint:
           name: "Evening Window"
           description: >
             Last top-up. Suggested: hours=1.5 (winter-sized),
-            start=19:00, end=22:00, type=Intermittent.
+            start=19:00, end=22:00. Type: Intermittent for Immersion,
+            Continuous for Heat Pumps.
           default: []
           selector:
             entity:
@@ -517,7 +525,7 @@ blueprint:
               mode: box
         legionella_max_days:
           name: "Maximum Cycle Interval (safety limit)"
-          description: "Force a cycle during the next overnight window."
+          description: "Force a cycle during the next active planned window."
           default: 10
           selector:
             number:
@@ -554,6 +562,24 @@ blueprint:
               step: 1
               unit_of_measurement: "°C"
               mode: slider
+
+        legionella_temperature_sensor:
+          name: "Legionella Verification Sensor (Optional)"
+          description: >
+            Optional second temperature sensor used ONLY to confirm a
+            pasteurisation cycle has reached target. Place this sensor
+            HIGH on the tank (top third) to verify the bulk of the
+            stored water reaches pasteurisation temperature — not just
+            the zone near the heating element. If left empty, the main
+            tank sensor is used for verification. A single sensor
+            cannot accurately monitor both depletion at the bottom and
+            pasteurisation at the top; use this input if you have both.
+          default: []
+          selector:
+            entity:
+              domain: sensor
+              device_class: temperature
+              multiple: false
 
     resilience:
       name: "Resilience & Safety"
@@ -610,7 +636,7 @@ blueprint:
 
 mode: queued
 max_exceeded: silent
-max: 3
+max: 10
 
 trigger:
   - id: "periodic"
@@ -679,6 +705,7 @@ action:
       leg_max_days: !input legionella_max_days
       leg_price: !input legionella_price_threshold
       leg_temp: !input legionella_temperature
+      leg_sensor: !input legionella_temperature_sensor
       stale_mins: !input stale_data_minutes
       dwell_mins: !input min_cycle_minutes
       manual_sw: !input manual_boost
@@ -733,6 +760,7 @@ action:
         {% else %}
           {% set gr = states(grid_sensor) %}
           {% if gr in ['unavailable', 'unknown', 'none', ''] %}false
+          {% elif not (gr | is_number) %}false
           {% else %}
             {% set grid_raw = gr | float(0) %}
             {% set uom = state_attr(grid_sensor, 'unit_of_measurement') | default('kW') %}
@@ -741,12 +769,13 @@ action:
             {% set fc_ok = true %}
             {% if forecast_sensor not in ['', none, []] %}
               {% set fv = states(forecast_sensor) %}
-              {% if fv in ['unavailable', 'unknown'] %}{% set fc_ok = false %}
+              {% if fv in ['unavailable', 'unknown'] or not (fv | is_number) %}
+                {% set fc_ok = false %}
               {% else %}
                 {% set nv = 0 %}
                 {% if current_solar_sensor not in ['', none, []] %}
                   {% set cv = states(current_solar_sensor) %}
-                  {% if cv not in ['unavailable', 'unknown'] %}
+                  {% if cv not in ['unavailable', 'unknown'] and (cv | is_number) %}
                     {% set nv = cv | float(0) %}
                   {% endif %}
                 {% endif %}
@@ -762,22 +791,33 @@ action:
         {% set nxt = 0 %}
         {% if current_solar_sensor not in ['', none, []] %}
           {% set v = states(current_solar_sensor) %}
-          {% if v not in ['unavailable', 'unknown'] %}{% set curr = v | float(0) %}{% endif %}
+          {% if v not in ['unavailable', 'unknown'] and (v | is_number) %}
+            {% set curr = v | float(0) %}
+          {% endif %}
         {% endif %}
         {% if forecast_sensor not in ['', none, []] %}
           {% set v = states(forecast_sensor) %}
-          {% if v not in ['unavailable', 'unknown'] %}{% set nxt = v | float(0) %}{% endif %}
+          {% if v not in ['unavailable', 'unknown'] and (v | is_number) %}
+            {% set nxt = v | float(0) %}
+          {% endif %}
         {% endif %}
-        {{ [curr, nxt] | max }}
+        {# Grace period: at the top of the hour solar integrations often  #}
+        {# drop current-hour to 0 momentarily before the next-hour value  #}
+        {# populates. Don't treat that two-minute blip as a real cutoff.  #}
+        {% if now().minute < 2 and curr == 0 and nxt == 0
+              and (current_solar_sensor not in ['', none, []]
+                   or forecast_sensor not in ['', none, []]) %}99
+        {% else %}{{ [curr, nxt] | max }}{% endif %}
       next_solar_kwh: >
         {% if forecast_sensor in ['', none, []] %}0
         {% else %}{% set v = states(forecast_sensor) %}
-          {% if v in ['unavailable', 'unknown'] %}0{% else %}{{ v | float(0) }}{% endif %}
+          {% if v in ['unavailable', 'unknown'] or not (v | is_number) %}0
+          {% else %}{{ v | float(0) }}{% endif %}
         {% endif %}
       next_rate_pence: >
         {% if next_rate_sensor in ['', none, []] %}{{ rate_pence }}
         {% else %}{% set v = states(next_rate_sensor) %}
-          {% if v in ['unavailable', 'unknown'] %}{{ rate_pence }}
+          {% if v in ['unavailable', 'unknown'] or not (v | is_number) %}{{ rate_pence }}
           {% else %}{{ (v | float(0)) * rate_mult }}{% endif %}
         {% endif %}
       effective_rate_now: >
@@ -801,6 +841,11 @@ action:
               {% if nt is not none %}
                 {% set secs = as_timestamp(nt) - as_timestamp(now()) %}
                 {% if secs > 0 and secs <= cutoff %}{% set ns.found = true %}{% endif %}
+              {% elif is_state(w, 'on') %}
+                {# next_time attribute is missing (e.g. integration just    #}
+                {# restarted) but the window is currently ON — treat as     #}
+                {# imminent so we don't miss an active planned window.      #}
+                {% set ns.found = true %}
               {% endif %}
             {% endif %}
           {% endfor %}
@@ -817,7 +862,14 @@ action:
           {% else %}{{ ((now_eff - next_eff) / now_eff * 100) >= (defer_pct|float) }}{% endif %}
         {% endif %}
       demand_boost: >
-        {% if overnight_s > overnight_e %}
+        {% if overnight_s == overnight_e %}
+          {# Overnight boost disabled by making start == end. Fall through  #}
+          {# to midday / evening blocks without accidentally matching the   #}
+          {# wrapped-past-midnight branch (which would give overnight all   #}
+          {# 24h).                                                          #}
+          {% if hour >= midday_s and hour < midday_e %}{{ boost_midday }}
+          {% else %}{{ boost_evening }}{% endif %}
+        {% elif overnight_s > overnight_e %}
           {% if hour >= overnight_s or hour < overnight_e %}{{ boost_overnight }}
           {% elif hour >= midday_s and hour < midday_e %}{{ boost_midday }}
           {% else %}{{ boost_evening }}{% endif %}
@@ -857,10 +909,16 @@ action:
         {{ not is_state(heater, 'off')
            and not is_state(heater, 'unavailable')
            and not is_state(heater, 'unknown') }}
-      dwell_ok: >
-        {% if not should_heat %}true
-        {% elif heater_currently_on %}true
-        {% else %}{{ dwell_elapsed }}{% endif %}
+      is_actively_heating: >
+        {% if ctrl_mode == 'on_off' %}
+          {{ heater_currently_on }}
+        {% else %}
+          {# set_temperature mode: heater is almost never 'off', so infer   #}
+          {# active heating from the current setpoint vs idle. A setpoint   #}
+          {# more than 1 C above idle means ThermoSync last told it to heat.#}
+          {% set current_setpoint = state_attr(heater, 'temperature') | float(0) %}
+          {{ current_setpoint > ((idle_temp|float) + 1) }}
+        {% endif %}
       should_heat_raw: >
         {% if not enabled %}false
         {% elif manual_boost_on and tank_valid %}true
@@ -875,19 +933,35 @@ action:
         {% elif needs_legionella and window_active and tank_temp < leg_temp %}true
         {% else %}false{% endif %}
       active_target: >
-        {% if manual_boost_on %}{{ [max_temp, neg_temp] | max }}
-        {% elif rate_pence <= 0 and rate_valid and not rate_stale %}{{ neg_temp }}
-        {% elif tank_temp <= depletion %}{{ emerg_temp }}
-        {% elif solar_ok %}{{ [smart_target|float, solar_target|float] | max }}
-        {% elif needs_legionella %}{{ leg_temp }}
-        {% elif data_degraded %}{{ base_temp }}
-        {% else %}{{ smart_target }}{% endif %}
+        {# Emergency recovery and solar are FLOORS, not ceilings — take the #}
+        {# max of the base target and any active floors so free solar can   #}
+        {# still be harvested when the tank has emptied, and negative-rate  #}
+        {# periods still apply during emergencies.                          #}
+        {% set base_t = base_temp %}
+        {% if data_degraded %}{% set base_t = base_temp %}
+        {% elif manual_boost_on %}{% set base_t = [max_temp, neg_temp] | max %}
+        {% elif rate_pence <= 0 and rate_valid and not rate_stale %}{% set base_t = neg_temp %}
+        {% elif needs_legionella %}{% set base_t = leg_temp %}
+        {% else %}{% set base_t = smart_target %}{% endif %}
+
+        {% set solar_t = solar_target if (solar_ok and not data_degraded) else 0 %}
+        {% set emerg_t = emerg_temp if (tank_temp <= depletion) else 0 %}
+
+        {{ [base_t|float, solar_t|float, emerg_t|float] | max }}
       should_heat: >
         {% if not should_heat_raw %}false
         {% elif tank_temp <= depletion %}true
         {% elif manual_boost_on %}true
         {% elif tank_temp >= ((active_target|float) - 0.5) %}false
-        {% elif tank_temp > ((active_target|float) - deadband) %}{{ not is_state(heater, 'off') }}
+        {% elif tank_temp > ((active_target|float) - deadband) %}{{ is_actively_heating }}
+        {% else %}true{% endif %}
+      dwell_ok: >
+        {# Protect the relay AND the compressor: enforce dwell before any   #}
+        {# state transition. Heat pumps must stay ON for min_cycle_minutes  #}
+        {# to avoid short-cycling; resistive elements benefit from dwell    #}
+        {# before re-engaging too.                                          #}
+        {% if is_actively_heating and not should_heat %}{{ dwell_elapsed }}
+        {% elif not is_actively_heating and should_heat %}{{ dwell_elapsed }}
         {% else %}true{% endif %}
       heater_domain: "{{ heater.split('.')[0] }}"
 
@@ -975,9 +1049,21 @@ action:
         value_template: >
           {% if leg_tracker in ['', none, []] %}false
           {% else %}
+            {# If a dedicated high-mounted verification sensor is provided, #}
+            {# use it to confirm pasteurisation — the main tank sensor may  #}
+            {# be low-mounted for depletion detection and read hotter than  #}
+            {# the actual top-of-tank volume. Fall back to the main tank    #}
+            {# sensor if the verification sensor is unavailable or invalid. #}
+            {% set verify_raw = states(leg_sensor)
+               if leg_sensor not in ['', none, []] else 'unavailable' %}
+            {% set verify_valid = verify_raw not in
+               ['unavailable', 'unknown', 'none', '']
+               and verify_raw is not none
+               and (verify_raw | is_number) %}
+            {% set verify_temp = (verify_raw | float(0)) if verify_valid else tank_temp %}
             {% set margin = 3 %}
-            {% set target_met = tank_temp >= ((leg_temp|float) - margin) %}
-            {% set above_60 = tank_temp >= 60 %}
+            {% set target_met = verify_temp >= ((leg_temp|float) - margin) %}
+            {% set above_60 = verify_temp >= 60 %}
             {{ target_met or (above_60 and needs_legionella) }}
           {% endif %}
     then:
@@ -990,7 +1076,11 @@ action:
   - if:
       - condition: template
         value_template: >
-          {{ manual_boost_on and tank_temp >= ((active_target|float) - 0.5) }}
+          {# Auto-clear the manual boost when the target is reached OR the  #}
+          {# tank sensor has gone invalid — otherwise a dead sensor would   #}
+          {# leave the boost latched on indefinitely.                       #}
+          {{ manual_boost_on and (not tank_valid
+             or tank_temp >= ((active_target|float) - 0.5)) }}
     then:
       - service: input_boolean.turn_off
         target:
