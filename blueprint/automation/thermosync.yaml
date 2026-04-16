@@ -19,7 +19,7 @@ blueprint:
     household profiles, and tuning guidance.
 
   domain: automation
-  source_url: "https://github.com/ha-community/thermosync/blob/main/blueprints/automation/thermosync.yaml"
+  source_url: "https://github.com/dandancheeseandham/thermosync-homeassistant/blob/main/blueprint/automation/thermosync.yaml"
   homeassistant:
     min_version: "2024.6.0"
 
